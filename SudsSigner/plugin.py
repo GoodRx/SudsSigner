@@ -5,9 +5,10 @@ from suds.plugin import MessagePlugin
 from lxml import etree
 from suds.bindings.binding import envns
 from suds.wsse import wsuns, dsns, wssens
+#from suds.wsse import wsuns, dsns
 from libxml2_wrapper import LibXML2ParsedDocument
 from xmlsec_wrapper import XmlSecSignatureContext, init_xmlsec, deinit_xmlsec
-from SignatureMethods import DSA, RSA
+from SignatureMethods import DSA, RSA, RSAMD5
 from OpenSSL import crypto
 from uuid import uuid4
 
@@ -22,11 +23,16 @@ def ns_id(tagname, suds_ns):
 LXML_ENV = lxml_ns(envns)
 BODY_XPATH = etree.XPath('/SOAP-ENV:Envelope/SOAP-ENV:Body', namespaces=LXML_ENV)
 HEADER_XPATH = etree.XPath('/SOAP-ENV:Envelope/SOAP-ENV:Header', namespaces=LXML_ENV)
+#wssens = ('wsse', 'http://schemas.xmlsoap.org/ws/2003/06/secext')
 SECURITY_XPATH = etree.XPath('wsse:Security', namespaces=lxml_ns(wssens))
 TIMESTAMP_XPATH = etree.XPath('wsu:Timestamp', namespaces=lxml_ns(wsuns))
 C14N = 'http://www.w3.org/2001/10/xml-exc-c14n#'
 XMLDSIG_SHA1 = 'http://www.w3.org/2000/09/xmldsig#sha1'
 NSMAP = dict((dsns, wssens, wsuns))
+
+BIN_ENCODING = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-soap-message-security-1.0#Base64Binary"
+BIN_VALUE_TYPE = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-x509-token-profile-1.0#X509v3"
+BIN_TOKEN = "http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd"
 
 class SignerPlugin(MessagePlugin):
     def __init__(self, keyfile, keytype=None, pwd=None, pwdCallback=None,
@@ -41,8 +47,8 @@ class SignerPlugin(MessagePlugin):
 
     def load_keyfile(self):
         with file(self.keyfile, 'rb') as keyfile:
-            self.cert = crypto.load_certificate(crypto.FILETYPE_PEM,
-                    keyfile.read())
+            val = keyfile.read()
+            self.cert = crypto.load_certificate(crypto.FILETYPE_PEM, val)
 
     def handle_keytype(self, keytype):
         if keytype is None:
@@ -58,6 +64,8 @@ class SignerPlugin(MessagePlugin):
             return DSA
         if algo.startswith('rsa'):
             return RSA
+        if algo.startswith('md5'):
+            return RSA
         raise ValueError('unknown keytype')
 
     def sending(self, context):
@@ -70,6 +78,16 @@ class SignerPlugin(MessagePlugin):
         context.envelope = self.get_signature(etree.tostring(env))
 
     def insert_signature_template(self, security, queue):
+        bin_security_token = etree.SubElement(security,
+                ns_id('BinarySecurityToken', wssens),
+                {'EncodingType': BIN_ENCODING,
+                 'ValueType': BIN_VALUE_TYPE})
+        bin_security_token.text = crypto.dump_certificate(1, self.cert)\
+                .replace('\n', '')\
+                .replace('-----BEGIN CERTIFICATE-----', '')\
+                .replace('-----END CERTIFICATE-----', '')
+        bin_security_token.set(ns_id('Id', wsuns), 'x509bst_243')
+
         signature = etree.SubElement(security, ns_id('Signature', dsns))
         self.append_signed_info(signature, queue)
         etree.SubElement(signature, ns_id('SignatureValue', dsns))
@@ -81,20 +99,15 @@ class SignerPlugin(MessagePlugin):
         set_algorithm(signed_info, 'SignatureMethod', self.keytype)
         queue.insert_references(signed_info)
 
+
     def append_key_info(self, signature):
         key_info = etree.SubElement(signature, ns_id('KeyInfo', dsns))
         sec_token_ref = etree.SubElement(key_info,
                 ns_id('SecurityTokenReference', wssens))
-        x509_data = etree.SubElement(sec_token_ref, ns_id('X509Data', dsns))
-        x509_issuer_serial = etree.SubElement(x509_data,
-                ns_id('X509IssuerSerial', dsns))
-        x509_issuer_name = etree.SubElement(x509_issuer_serial,
-                ns_id('X509IssuerName', dsns))
-        x509_issuer_name.text = ', '.join(
-                '='.join(c) for c in self.cert.get_issuer().get_components())
-        x509_serial_number = etree.SubElement(x509_issuer_serial,
-                ns_id('X509SerialNumber', dsns))
-        x509_serial_number.text = str(self.cert.get_serial_number())
+        ref = etree.SubElement(sec_token_ref,
+                ns_id('Reference', wssens),
+                {'URI':'#x509bst_243',
+                 'ValueType':'http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-x509-token-profile-1.0#X509v3'})
 
     def get_signature(self, envelope):
         with LibXML2ParsedDocument(envelope) as doc:
@@ -114,6 +127,8 @@ class SignQueue(object):
     DS_DIGEST_VALUE = ns_id('DigestValue', dsns)
     DS_REFERENCE = ns_id('Reference', dsns)
     DS_TRANSFORMS = ns_id('Transforms', dsns)
+    DS_INCLUSIVE = ns_id('Transform',
+            ('ec', 'http://www.w3.org/2001/10/xml-exc-c14n#'))
 
     def __init__(self):
         self.queue = []
@@ -128,7 +143,15 @@ class SignQueue(object):
             reference = etree.SubElement(signed_info, self.DS_REFERENCE,
                     {'URI': '#{0}'.format(element_id)})
             transforms = etree.SubElement(reference, self.DS_TRANSFORMS)
-            set_algorithm(transforms, 'Transform', C14N)
+            transform = etree.SubElement(transforms, ns_id('Transform', dsns),
+                    {'Algorithm':C14N})
+            inclusive = etree.SubElement(transform,
+                    ns_id('InclusiveNamespaces',
+                         ('ec', 'http://www.w3.org/2001/10/xml-exc-c14n#')),
+                    {'PrefixList': 'p298 p501 soapenc soapenv wsu xsd xsi'})
+
+            #transform = set_algorithm(transforms, 'Transform', C14N)
+
             set_algorithm(reference, 'DigestMethod', XMLDSIG_SHA1)
             etree.SubElement(reference, self.DS_DIGEST_VALUE)
 
@@ -136,11 +159,12 @@ def get_unique_id():
     return 'id-{0}'.format(uuid4())
 
 def set_algorithm(parent, name, value):
-    etree.SubElement(parent, ns_id(name, dsns), {'Algorithm': value})
+    return etree.SubElement(parent, ns_id(name, dsns), {'Algorithm': value})
 
 def ensure_security_header(env, queue):
     (header,) = HEADER_XPATH(env)
     security = SECURITY_XPATH(header)
+
     if security:
         for timestamp in TIMESTAMP_XPATH(security[0]):
             queue.push_and_mark(timestamp)
@@ -148,3 +172,4 @@ def ensure_security_header(env, queue):
     else:
         return etree.SubElement(header, ns_id('Security', wssens),
                 {ns_id('mustUnderstand', envns): '1'}, NSMAP)
+
